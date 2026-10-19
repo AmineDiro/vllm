@@ -10,6 +10,8 @@ Endpoints: `tito` (/inference/v1/generate, token ids in, token ids out, main's i
 
 import argparse
 import asyncio
+import base64
+import io
 import json
 import os
 import random
@@ -17,6 +19,7 @@ import statistics
 import time
 
 import aiohttp
+import numpy as np
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
@@ -100,6 +103,8 @@ async def one(session, args, prompt_ids, messages, sem, rows):
         }
         if args.no_detokenize:
             params["detokenize"] = False
+        if args.flat_logprobs:
+            params["flat_logprobs"] = True
         if args.endpoint == "completions":
             path = "/v1/completions"
             payload = {"model": MODEL, "prompt": prompt_ids, "return_token_ids": True, "return_tokens_as_token_ids": True, **params}
@@ -124,7 +129,14 @@ async def one(session, args, prompt_ids, messages, sem, rows):
             n_tokens = len(choice["token_ids"])
             mask_entries = sum(map(len, choice.get("sampling_mask") or []))
             tops = None
-            if args.logprobs:
+            if args.logprobs and choice.get("flat_logprobs"):
+                flat = {k: np.load(io.BytesIO(base64.b64decode(v))) for k, v in choice["flat_logprobs"].items()}
+                if "offsets" in flat:
+                    offsets = flat["offsets"]
+                    tops = [dict(zip(flat["token_ids"][a:b].tolist(), flat["logprobs"][a:b].tolist())) for a, b in zip(offsets[:-1], offsets[1:])]
+                else:
+                    tops = [dict(zip(ids, lps)) for ids, lps in zip(flat["token_ids"].tolist(), flat["logprobs"].tolist())]
+            elif args.logprobs:
                 if args.endpoint == "completions":
                     tops = [{int(t.removeprefix("token_id:")): lp for t, lp in top.items()} for top in choice["logprobs"]["top_logprobs"]]
                 else:
@@ -210,6 +222,7 @@ if __name__ == "__main__":
     parser.add_argument("--out", required=True)
     parser.add_argument("--shard", default="0/1", help="i/n: this client takes every n-th prompt starting at i")
     parser.add_argument("--no-detokenize", action="store_true", help="ask the server not to produce text")
+    parser.add_argument("--flat-logprobs", action="store_true", help="sampling_params.flat_logprobs: logprobs as npy arrays")
     parser.add_argument("--force-close", action="store_true", help="one TCP connection per request instead of keep-alive")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()

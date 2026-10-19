@@ -99,7 +99,41 @@ def main():
         "model_dump_json": timeit(lambda: lp.model_dump_json(), reps),
         "bytes": len(starlette_json(dumped)),
     }
-    for ep in ("tito", "chat"):
+    # flat_logprobs on the branch that has it: the container filled like the engine does, then the npy response
+    try:
+        from vllm.entrypoints.scale_out.token_in_token_out.serving import _create_flat_logprobs
+        from vllm.logprobs import FlatLogprobs, append_logprobs_for_next_position
+    except ImportError:
+        pass
+    else:
+        rows = []  # the engine's layout: the sampled token first, then k candidates, k + 1 entries per position
+        for i, sampled in enumerate(ids):
+            cands = [2000 + (i * 31 + j * 101) % 50000 for j in range(k)]
+            rows.append(([sampled, *cands], [-0.3 - (i % 5) / 10, *(-1.0 - j for j in range(k))]))
+
+        def fill():
+            flat = FlatLogprobs()
+            for row_ids, row_lps in rows:
+                append_logprobs_for_next_position(flat, row_ids, row_lps, [None] * len(row_ids), 1, k)
+            return flat
+
+        flat = fill()
+
+        def flat_build():
+            lp = _create_flat_logprobs(flat)
+            return GenerateTokensResponse(
+                request_id="r", choices=[GenerateTokensChoice(index=0, token_ids=ids, flat_logprobs=lp)],
+                usage=UsageInfo(prompt_tokens=10, completion_tokens=tokens, total_tokens=tokens + 10),
+            )
+
+        resp = flat_build()
+        report["flat"] = {
+            "fill": timeit(fill, reps),
+            "build": timeit(flat_build, reps),
+            "model_dump_json": timeit(lambda: resp.model_dump_json(), reps),
+            "bytes": len(resp.model_dump_json().encode()),
+        }
+    for ep in [ep for ep in ("tito", "chat", "flat") if ep in report]:
         report[ep] = {key: (v * 1e6 / tokens if key != "bytes" else v / tokens) for key, v in report[ep].items()}
     print(json.dumps(report))
 
